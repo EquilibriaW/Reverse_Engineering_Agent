@@ -19,6 +19,8 @@ if ! curl -fsS http://127.0.0.1:19110/control/health >/dev/null 2>&1; then
   exit 1
 fi
 
+rm -rf /opt/internal
+
 if [ "$#" -eq 0 ]; then
   su -s /bin/bash agent -c 'cd /workspace && sleep infinity'
   STATUS=$?

@@ -268,6 +268,9 @@ class QueueService:
             if not enqueued:
                 return False
             head = enqueued[0]
+            if head['type'] == 'documentAdditionOrUpdate':
+                if self._duration_seconds(head['enqueuedAt'], utc_now()) < self.scheduler_idle_seconds:
+                    return False
             batch = [head]
             if head['type'] == 'documentAdditionOrUpdate':
                 for task in enqueued[1:]:

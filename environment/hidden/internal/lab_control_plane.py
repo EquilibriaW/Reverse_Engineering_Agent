@@ -1,14 +1,13 @@
-
 import gzip
+import importlib
 import json
 import os
 import shutil
-import signal
-import subprocess
+import sys
 import threading
 import time
 from pathlib import Path
-from typing import Optional
+from typing import Callable, Optional
 
 import requests
 import uvicorn
@@ -26,7 +25,9 @@ REFERENCE_APP_FILE = Path(os.environ.get('REFERENCE_APP_FILE', '/opt/internal/re
 WEBHOOK_AUTH = 'Bearer probe-lab-secret'
 
 app = FastAPI(title='Probe Lab Control Plane')
-_ref_proc: Optional[subprocess.Popen] = None
+_ref_server: Optional[uvicorn.Server] = None
+_ref_thread: Optional[threading.Thread] = None
+_build_reference_app: Optional[Callable[[], FastAPI]] = None
 _batch_counter = 0
 _lock = threading.RLock()
 
@@ -44,37 +45,62 @@ def _wait_healthy(timeout: float = 15.0) -> None:
     raise RuntimeError('reference service failed to become healthy')
 
 
-def _start_reference() -> None:
-    global _ref_proc
-    ensure_dirs()
-    env = os.environ.copy()
-    env.update({
+def _configure_reference_env() -> None:
+    os.environ.update({
         'ENGINE_DATA_DIR': str(STATE_DIR),
         'ENGINE_TASK_WEBHOOK_URL': f'http://127.0.0.1:{CONTROL_PORT}/hook',
         'ENGINE_TASK_WEBHOOK_AUTHORIZATION_HEADER': WEBHOOK_AUTH,
     })
-    _ref_proc = subprocess.Popen([
-        'python', '-m', 'uvicorn', 'runtime_contract_service:app',
-        '--host', REFERENCE_HOST,
-        '--port', str(REFERENCE_PORT),
-        '--app-dir', str(REFERENCE_APP_FILE.parent),
-        '--log-level', 'warning',
-    ], env=env, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-    _wait_healthy()
+
+
+def _load_reference_factory() -> Callable[[], FastAPI]:
+    global _build_reference_app
+    if _build_reference_app is not None:
+        return _build_reference_app
+
+    app_dir = str(REFERENCE_APP_FILE.parent)
+    if app_dir not in sys.path:
+        sys.path.insert(0, app_dir)
+    module = importlib.import_module('runtime_contract_service')
+    _build_reference_app = module.build_app
+    return _build_reference_app
+
+
+def _start_reference() -> None:
+    global _ref_server, _ref_thread
+    ensure_dirs()
+    _configure_reference_env()
+    build_app = _load_reference_factory()
+    config = uvicorn.Config(build_app(), host=REFERENCE_HOST, port=REFERENCE_PORT, log_level='warning')
+    server = uvicorn.Server(config)
+    thread = threading.Thread(target=server.run, daemon=True)
+    _ref_server = server
+    _ref_thread = thread
+    thread.start()
+    try:
+        _wait_healthy()
+    except Exception:
+        _stop_reference()
+        raise
 
 
 def _stop_reference() -> None:
-    global _ref_proc
-    if _ref_proc is None:
+    global _ref_server, _ref_thread
+    if _ref_server is None:
         return
-    proc = _ref_proc
-    _ref_proc = None
-    proc.terminate()
-    try:
-        proc.wait(timeout=10)
-    except subprocess.TimeoutExpired:
-        proc.kill()
-        proc.wait(timeout=5)
+    server = _ref_server
+    thread = _ref_thread
+    _ref_server = None
+    _ref_thread = None
+    server.should_exit = True
+    if thread is None:
+        return
+    thread.join(timeout=10)
+    if thread.is_alive():
+        server.force_exit = True
+        thread.join(timeout=5)
+    if thread.is_alive():
+        raise RuntimeError('reference service failed to stop')
 
 
 def ensure_dirs() -> None:
