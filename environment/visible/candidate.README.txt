@@ -1,0 +1,7 @@
+Create your implementation inside this directory.
+
+Required output:
+- `run.sh` at the root of this directory
+- any additional source files you need
+
+`run.sh` must start a server on `127.0.0.1:8108` and block.

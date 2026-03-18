@@ -1,0 +1,18 @@
+version = "0.1"
+
+[metadata]
+author = "Alex Wang"
+difficulty = "hard"
+category = "systems_programming"
+tags = ["reverse-engineering", "runtime-state", "async-queue", "webhook", "persistence", "compatibility"]
+
+[environment]
+cpus = 4
+memory_gb = 8
+disk_gb = 10
+
+[agent]
+timeout_sec = 1800
+
+[verifier]
+timeout_sec = 1800
