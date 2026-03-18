@@ -1,4 +1,4 @@
-version = "0.1"
+version = "1.0"
 
 [metadata]
 author = "Alex Wang"
@@ -8,8 +8,8 @@ tags = ["reverse-engineering", "runtime-state", "async-queue", "webhook", "persi
 
 [environment]
 cpus = 4
-memory_gb = 8
-disk_gb = 10
+memory_mb = 8192
+storage_mb = 10240
 
 [agent]
 timeout_sec = 1800
