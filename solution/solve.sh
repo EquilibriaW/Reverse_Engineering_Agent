@@ -22,6 +22,23 @@ from fastapi import FastAPI, HTTPException, Query, Request
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel
 
+from api_surface import (
+    ABORT_JOBS_ROUTE,
+    HEALTH_ROUTE,
+    JOBS_ROUTE,
+    JOB_ROUTE,
+    STORE_RECORDS_ROUTE,
+    STORE_RECORD_ROUTE,
+    decode_filter_params,
+    decode_records_payload,
+    encode_document_list,
+    encode_error_detail,
+    encode_task,
+    encode_task_list,
+    encode_task_summary,
+    encode_webhook_payload,
+)
+
 
 def utc_now() -> str:
     return datetime.now(timezone.utc).strftime('%Y-%m-%dT%H:%M:%S.%fZ')
@@ -469,7 +486,7 @@ class QueueService:
     def _send_webhook(self, payload: List[Dict[str, Any]]) -> None:
         if not self.webhook_url:
             return
-        lines = '\n'.join(json.dumps(item, separators=(',', ':')) for item in payload).encode('utf-8')
+        lines = '\n'.join(json.dumps(item, separators=(',', ':')) for item in encode_webhook_payload(payload)).encode('utf-8')
         compressed = gzip.compress(lines)
         headers = {
             'Content-Type': 'application/jsonl',
@@ -484,18 +501,6 @@ class QueueService:
             self.webhook_log_path.parent.mkdir(parents=True, exist_ok=True)
             with self.webhook_log_path.open('a', encoding='utf-8') as f:
                 f.write(f'{utc_now()} webhook_error {exc}\n')
-
-
-def parse_query_filters(request: Request) -> Dict[str, str]:
-    allowed = {'uids', 'statuses', 'types', 'indexUids', 'canceledBy', 'limit', 'from'}
-    filters = {}
-    for key, value in request.query_params.items():
-        if value is None or value == '':
-            continue
-        if key in allowed:
-            filters[key] = value
-    return filters
-
 
 def build_app() -> FastAPI:
     data_dir = os.environ.get('ENGINE_DATA_DIR', '/tmp/engine-data')
@@ -525,59 +530,61 @@ def build_app() -> FastAPI:
     async def _http_exception_handler(_: Request, exc: HTTPException):
         detail = exc.detail
         if isinstance(detail, dict):
-            return JSONResponse(status_code=exc.status_code, content=detail)
+            return JSONResponse(status_code=exc.status_code, content=encode_error_detail(detail))
         return JSONResponse(status_code=exc.status_code, content={'message': detail})
 
-    @app.get('/health')
+    @app.get(HEALTH_ROUTE)
     async def health() -> Dict[str, str]:
         return {'status': 'available'}
 
-    @app.post('/indexes/{index_uid}/documents')
+    @app.post(STORE_RECORDS_ROUTE)
     async def add_documents(index_uid: str, request: Request):
         body = await request.json()
-        if not isinstance(body, list):
-            raise HTTPException(status_code=400, detail={'message': 'Body must be a JSON array of documents.', 'code': 'invalid_documents_payload', 'type': 'invalid_request'})
-        summary = service.enqueue_document_add(index_uid, body)
-        return JSONResponse(status_code=202, content=summary)
+        docs = decode_records_payload(body)
+        if docs is None:
+            raise HTTPException(status_code=400, detail={'message': 'Body must be a JSON object with a records array.', 'code': 'invalid_documents_payload', 'type': 'invalid_request'})
+        summary = service.enqueue_document_add(index_uid, docs)
+        return JSONResponse(status_code=202, content=encode_task_summary(summary))
 
-    @app.get('/indexes/{index_uid}/documents/{doc_id}')
+    @app.get(STORE_RECORD_ROUTE)
     async def get_document(index_uid: str, doc_id: str):
         return service.get_document(index_uid, doc_id)
 
-    @app.get('/indexes/{index_uid}/documents')
+    @app.get(STORE_RECORDS_ROUTE)
     async def list_documents(index_uid: str):
-        return {'results': service.list_documents(index_uid)}
+        return encode_document_list(service.list_documents(index_uid))
 
-    @app.get('/tasks/{task_uid}')
+    @app.get(JOB_ROUTE)
     async def get_task(task_uid: int):
-        return service.get_task(task_uid)
+        return encode_task(service.get_task(task_uid))
 
-    @app.get('/tasks')
+    @app.get(JOBS_ROUTE)
     async def list_tasks(request: Request):
-        filters = parse_query_filters(request)
-        return service.list_tasks(filters)
+        filters = decode_filter_params(request.query_params)
+        return encode_task_list(service.list_tasks(filters))
 
-    @app.post('/tasks/cancel')
+    @app.post(ABORT_JOBS_ROUTE)
     async def cancel_tasks(request: Request):
-        filters = parse_query_filters(request)
+        filters = decode_filter_params(request.query_params)
         filters.pop('limit', None)
         filters.pop('from', None)
         summary = service.enqueue_cancel(filters)
-        return JSONResponse(status_code=202, content=summary)
+        return JSONResponse(status_code=202, content=encode_task_summary(summary))
 
-    @app.delete('/tasks')
+    @app.delete(JOBS_ROUTE)
     async def delete_tasks(request: Request):
-        filters = parse_query_filters(request)
+        filters = decode_filter_params(request.query_params)
         filters.pop('limit', None)
         filters.pop('from', None)
         summary = service.enqueue_delete(filters)
-        return JSONResponse(status_code=202, content=summary)
+        return JSONResponse(status_code=202, content=encode_task_summary(summary))
 
     return app
 
 
 app = build_app()
 PYCODE
+cp "$(cd "$(dirname "$0")" && pwd)/api_surface.py" "$ROOT/api_surface.py"
 cat > "$ROOT/run.sh" <<'BASH'
 #!/usr/bin/env bash
 set -euo pipefail

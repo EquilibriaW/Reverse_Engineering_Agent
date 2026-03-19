@@ -6,6 +6,7 @@ import os
 import shutil
 import socketserver
 import subprocess
+import sys
 import tempfile
 import threading
 import time
@@ -13,6 +14,33 @@ from pathlib import Path
 from typing import Dict, List, Optional
 
 import requests
+
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+
+from api_surface import (
+    ABORTED_BY_KEY,
+    ABORTED_JOBS_KEY,
+    ABORTED_STATE,
+    ABORT_JOBS_ROUTE,
+    DONE_STATE,
+    ERRORED_STATE,
+    ITEMS_KEY,
+    JOB_ABORT_KIND,
+    JOB_ID_KEY,
+    JOB_NOT_FOUND_CODE,
+    JOB_PRUNE_KIND,
+    JOB_ROUTE,
+    JOBS_ROUTE,
+    KIND_KEY,
+    MATCHED_JOBS_KEY,
+    MISSING_JOB_FILTERS_CODE,
+    QUEUED_STATE,
+    RECORDS_BODY_KEY,
+    REMOVED_JOBS_KEY,
+    RUNNING_STATE,
+    STATE_KEY,
+    STORE_RECORDS_ROUTE,
+)
 
 REFERENCE_BASE = "http://127.0.0.1:9108"
 CONTROL_BASE = "http://127.0.0.1:19110"
@@ -189,24 +217,24 @@ class CandidateProcess:
 
 
 def enqueue_docs(index_uid: str, docs: List[Dict]):
-    r = request("POST", f"{CANDIDATE_BASE}/indexes/{index_uid}/documents", json=docs)
+    r = request("POST", f"{CANDIDATE_BASE}{STORE_RECORDS_ROUTE.format(index_uid=index_uid)}", json={RECORDS_BODY_KEY: docs})
     assert r.status_code == 202, r.text
-    return r.json()["taskUid"]
+    return r.json()[JOB_ID_KEY]
 
 
 def get_task(uid: int):
-    r = request("GET", f"{CANDIDATE_BASE}/tasks/{uid}")
+    r = request("GET", f"{CANDIDATE_BASE}{JOB_ROUTE.format(task_uid=uid)}")
     return r
 
 
 def list_tasks(**params):
-    r = request("GET", f"{CANDIDATE_BASE}/tasks", params=params)
+    r = request("GET", f"{CANDIDATE_BASE}{JOBS_ROUTE}", params=params)
     assert r.status_code == 200, r.text
     return r.json()
 
 
 def wait_task(uid: int, target_statuses=None, timeout: float = 20.0):
-    target_statuses = set(target_statuses or ["succeeded", "failed", "canceled"])
+    target_statuses = set(target_statuses or [DONE_STATE, ERRORED_STATE, ABORTED_STATE])
     deadline = time.time() + timeout
     latest = None
     while time.time() < deadline:
@@ -214,16 +242,16 @@ def wait_task(uid: int, target_statuses=None, timeout: float = 20.0):
         assert r.status_code in (200, 404), r.text
         if r.status_code == 200:
             latest = r.json()
-            if latest["status"] in target_statuses:
+            if latest[STATE_KEY] in target_statuses:
                 return latest
         time.sleep(0.05)
     raise AssertionError(f"task {uid} did not reach {target_statuses}: latest={latest}")
 
 
 def list_docs(index_uid: str):
-    r = request("GET", f"{CANDIDATE_BASE}/indexes/{index_uid}/documents")
+    r = request("GET", f"{CANDIDATE_BASE}{STORE_RECORDS_ROUTE.format(index_uid=index_uid)}")
     assert r.status_code == 200, r.text
-    return r.json()["results"]
+    return r.json()[ITEMS_KEY]
 
 
 def check_probe_lab_integrity():
@@ -248,11 +276,11 @@ def case_batching_and_hook_payload():
                 ta0 = wait_task(a0)
                 ta1 = wait_task(a1)
                 tb0 = wait_task(b0)
-                assert ta0["status"] == ta1["status"] == tb0["status"] == "succeeded"
+                assert ta0[STATE_KEY] == ta1[STATE_KEY] == tb0[STATE_KEY] == DONE_STATE
                 assert ta0["startedAt"] == ta1["startedAt"]
-                assert ta0["finishedAt"] == ta1["finishedAt"]
-                assert ta0["duration"] == ta1["duration"]
-                assert not (tb0["startedAt"] == ta0["startedAt"] and tb0["finishedAt"] == ta0["finishedAt"])
+                assert ta0["endedAt"] == ta1["endedAt"]
+                assert ta0["elapsed"] == ta1["elapsed"]
+                assert not (tb0["startedAt"] == ta0["startedAt"] and tb0["endedAt"] == ta0["endedAt"])
                 assert [d["id"] for d in list_docs("alpha")] == [1, 2]
                 assert [d["id"] for d in list_docs("beta")] == [10]
                 deadline = time.time() + 10
@@ -279,26 +307,26 @@ def case_cancel_interrupts_batch():
             t1 = enqueue_docs("ix", [{"id": 2, "title": "cancel-me"}])
             t2 = enqueue_docs("ix", [{"id": 3, "title": "also-cancel"}])
             time.sleep(0.12)
-            r = request("POST", f"{CANDIDATE_BASE}/tasks/cancel", params={"uids": f"{t1},{t2}"})
+            r = request("POST", f"{CANDIDATE_BASE}{ABORT_JOBS_ROUTE}", params={"ids": f"{t1},{t2}"})
             assert r.status_code == 202, r.text
-            cancel_uid = r.json()["taskUid"]
+            cancel_uid = r.json()[JOB_ID_KEY]
             cancel_task = wait_task(cancel_uid)
             after_t0 = wait_task(t0)
             after_t1 = wait_task(t1)
             after_t2 = wait_task(t2)
-            assert cancel_task["type"] == "taskCancelation"
-            assert cancel_task["status"] == "succeeded"
-            assert cancel_task["details"]["matchedTasks"] >= 2
-            assert cancel_task["details"]["canceledTasks"] >= 2
-            assert after_t0["status"] == "succeeded"
-            assert after_t1["status"] == "canceled"
-            assert after_t2["status"] == "canceled"
-            assert after_t1["canceledBy"] == cancel_uid
-            assert after_t2["canceledBy"] == cancel_uid
+            assert cancel_task[KIND_KEY] == JOB_ABORT_KIND
+            assert cancel_task[STATE_KEY] == DONE_STATE
+            assert cancel_task["meta"][MATCHED_JOBS_KEY] >= 2
+            assert cancel_task["meta"][ABORTED_JOBS_KEY] >= 2
+            assert after_t0[STATE_KEY] == DONE_STATE
+            assert after_t1[STATE_KEY] == ABORTED_STATE
+            assert after_t2[STATE_KEY] == ABORTED_STATE
+            assert after_t1[ABORTED_BY_KEY] == cancel_uid
+            assert after_t2[ABORTED_BY_KEY] == cancel_uid
             docs = list_docs("ix")
             assert [d["id"] for d in docs] == [1]
-            filtered = list_tasks(statuses="canceled", canceledBy=str(cancel_uid))
-            canceled_ids = sorted(t["uid"] for t in filtered["results"])
+            filtered = list_tasks(states=ABORTED_STATE, abortedBy=str(cancel_uid))
+            canceled_ids = sorted(t[JOB_ID_KEY] for t in filtered[ITEMS_KEY])
             assert t1 in canceled_ids and t2 in canceled_ids
         finally:
             cp.stop()
@@ -311,25 +339,25 @@ def case_task_deletion_filters():
             t0 = enqueue_docs("delix", [{"id": 1, "title": "x"}])
             t1 = enqueue_docs("delix", [{"id": 2, "title": "y"}])
             time.sleep(0.1)
-            r = request("POST", f"{CANDIDATE_BASE}/tasks/cancel", params={"uids": str(t1)})
+            r = request("POST", f"{CANDIDATE_BASE}{ABORT_JOBS_ROUTE}", params={"ids": str(t1)})
             assert r.status_code == 202, r.text
-            cancel_uid = r.json()["taskUid"]
+            cancel_uid = r.json()[JOB_ID_KEY]
             wait_task(cancel_uid)
             wait_task(t0)
             wait_task(t1)
-            missing = request("DELETE", f"{CANDIDATE_BASE}/tasks")
+            missing = request("DELETE", f"{CANDIDATE_BASE}{JOBS_ROUTE}")
             assert missing.status_code == 400, missing.text
-            assert missing.json()["code"] == "missing_task_filters"
-            delete = request("DELETE", f"{CANDIDATE_BASE}/tasks", params={"statuses": "canceled"})
+            assert missing.json()["code"] == MISSING_JOB_FILTERS_CODE
+            delete = request("DELETE", f"{CANDIDATE_BASE}{JOBS_ROUTE}", params={"states": ABORTED_STATE})
             assert delete.status_code == 202, delete.text
-            delete_uid = delete.json()["taskUid"]
+            delete_uid = delete.json()[JOB_ID_KEY]
             delete_task = wait_task(delete_uid)
-            assert delete_task["type"] == "taskDeletion"
-            assert delete_task["details"]["matchedTasks"] >= 1
-            assert delete_task["details"]["deletedTasks"] >= 1
+            assert delete_task[KIND_KEY] == JOB_PRUNE_KIND
+            assert delete_task["meta"][MATCHED_JOBS_KEY] >= 1
+            assert delete_task["meta"][REMOVED_JOBS_KEY] >= 1
             r404 = get_task(t1)
             assert r404.status_code == 404, r404.text
-            assert r404.json()["code"] == "task_not_found"
+            assert r404.json()["code"] == JOB_NOT_FOUND_CODE
         finally:
             cp.stop()
 
@@ -344,19 +372,19 @@ def case_webhook_blocks_scheduler_and_logs_failures():
                 t1 = enqueue_docs("wh", [{"id": 2, "title": "b"}])
                 first = wait_task(t0)
                 second = wait_task(t1)
-                assert first["status"] == second["status"] == "succeeded"
+                assert first[STATE_KEY] == second[STATE_KEY] == DONE_STATE
 
                 t2 = enqueue_docs("wh", [{"id": 3, "title": "c"}])
                 time.sleep(0.15)
                 assert hook.state.first_arrived.wait(timeout=10), "first hook request never arrived"
                 t3 = enqueue_docs("wh", [{"id": 4, "title": "d"}])
                 time.sleep(0.25)
-                mid = wait_task(t3, target_statuses=["enqueued", "processing", "succeeded"], timeout=2)
-                assert mid["status"] in ["enqueued", "processing"]
+                mid = wait_task(t3, target_statuses=[QUEUED_STATE, RUNNING_STATE, DONE_STATE], timeout=2)
+                assert mid[STATE_KEY] in [QUEUED_STATE, RUNNING_STATE]
                 hook.state.release_event.set()
                 after_t2 = wait_task(t2)
                 after_t3 = wait_task(t3)
-                assert after_t2["status"] == after_t3["status"] == "succeeded"
+                assert after_t2[STATE_KEY] == after_t3[STATE_KEY] == DONE_STATE
                 log_path = Path(td) / "scheduler.log"
                 deadline = time.time() + 10
                 while time.time() < deadline and not log_path.exists():
@@ -389,7 +417,7 @@ def case_restart_recovery_and_uids():
                 r = get_task(t0)
                 assert r.status_code == 200, r.text
                 task = r.json()
-                if task["status"] == "processing":
+                if task[STATE_KEY] == RUNNING_STATE:
                     seen_processing = True
                     break
                 time.sleep(0.05)
@@ -399,11 +427,11 @@ def case_restart_recovery_and_uids():
         cp2 = CandidateProcess(td_path, processing_steps=24, processing_step_seconds=0.05).start()
         try:
             finished = wait_task(t0, timeout=20)
-            assert finished["status"] == "succeeded"
+            assert finished[STATE_KEY] == DONE_STATE
             assert [d["id"] for d in list_docs("persist")] == [1]
             t1 = enqueue_docs("persist", [{"id": 2, "title": "q"}])
             finished2 = wait_task(t1)
-            assert finished2["status"] == "succeeded"
+            assert finished2[STATE_KEY] == DONE_STATE
             assert t1 > t0
         finally:
             cp2.stop()

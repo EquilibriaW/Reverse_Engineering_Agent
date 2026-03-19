@@ -4,7 +4,7 @@ version = "1.0"
 author = "Alex Wang"
 difficulty = "hard"
 category = "systems_programming"
-tags = ["reverse-engineering", "runtime-state", "async-queue", "webhook", "persistence", "compatibility"]
+tags = ["reverse-engineering", "runtime-state", "async-queue", "webhook", "persistence"]
 
 [environment]
 cpus = 4
