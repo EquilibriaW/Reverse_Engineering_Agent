@@ -12,7 +12,7 @@ memory_mb = 8192
 storage_mb = 10240
 
 [agent]
-timeout_sec = 1800
+timeout_sec = 3600
 
 [verifier]
 timeout_sec = 1800

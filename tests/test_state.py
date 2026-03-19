@@ -51,6 +51,10 @@ REWARD_PATH = Path("/logs/verifier/reward.txt")
 REPORT_PATH = Path("/logs/verifier/report.json")
 IMMUTABLE_HASHES = {"README.md": "2f9bc972d5066e282d1ffeac6a24e36e37c4bc3008c2f37fbc2898e47edd62b0", "clear_reference_hookbox.sh": "137536bb0d4c3e510e502f7a0dfe168c6075a5ed66d77e1532453c1b316257b8", "reset_reference.sh": "e21547c33fda1f129af72bc473ec26bf7f7c445a76e52abe410eddee7a201d7f", "restart_reference.sh": "18287a857f2304223e803983999d68e046031b98ffdc3bd1f7e7d37a3e789535", "wait_reference.sh": "1a1d5dfe45556dc81196409cf130d8bfe10f7c8852f9cab2e674e147d0ebac19"}
 WEBHOOK_AUTH = "Bearer hidden-verifier-auth"
+EXPECTED_ENQUEUE_STATUS = 202
+ACCEPTED_ENQUEUE_STATUSES = {200, EXPECTED_ENQUEUE_STATUS}
+ENQUEUE_STATUS_PENALTY = 0.05
+enqueue_statuses: List[int] = []
 
 
 def sha256_file(path: Path) -> str:
@@ -218,7 +222,8 @@ class CandidateProcess:
 
 def enqueue_docs(index_uid: str, docs: List[Dict]):
     r = request("POST", f"{CANDIDATE_BASE}{STORE_RECORDS_ROUTE.format(index_uid=index_uid)}", json={RECORDS_BODY_KEY: docs})
-    assert r.status_code == 202, r.text
+    assert r.status_code in ACCEPTED_ENQUEUE_STATUSES, r.text
+    enqueue_statuses.append(r.status_code)
     return r.json()[JOB_ID_KEY]
 
 
@@ -464,10 +469,24 @@ def main():
     run_case("restart_recovery_and_uids", case_restart_recovery_and_uids)
 
     reward = sum(r["weight"] for r in results if r["passed"])
+    penalties = []
+    non_async_enqueue_count = sum(status != EXPECTED_ENQUEUE_STATUS for status in enqueue_statuses)
+    if non_async_enqueue_count:
+        reward = max(0.0, reward - ENQUEUE_STATUS_PENALTY)
+        penalties.append({
+            "name": "enqueue_status_not_202",
+            "amount": ENQUEUE_STATUS_PENALTY,
+            "count": non_async_enqueue_count,
+            "expected": EXPECTED_ENQUEUE_STATUS,
+            "observed": sorted(set(enqueue_statuses)),
+        })
     REWARD_PATH.parent.mkdir(parents=True, exist_ok=True)
     REWARD_PATH.write_text(f"{reward:.4f}\n", encoding="utf-8")
-    REPORT_PATH.write_text(json.dumps({"reward": reward, "results": results}, indent=2), encoding="utf-8")
-    print(json.dumps({"reward": reward, "results": results}, indent=2))
+    report = {"reward": reward, "results": results}
+    if penalties:
+        report["penalties"] = penalties
+    REPORT_PATH.write_text(json.dumps(report, indent=2), encoding="utf-8")
+    print(json.dumps(report, indent=2))
 
 
 if __name__ == "__main__":

@@ -10,13 +10,28 @@ It does **not** care about matching any internal module layout, class hierarchy,
 Your implementation must expose these HTTP resources on `127.0.0.1:8108`:
 
 - `GET /health`
-- `POST /indexes/{index_uid}/documents`
-- `GET /indexes/{index_uid}/documents`
-- `GET /indexes/{index_uid}/documents/{doc_id}`
-- `GET /tasks`
-- `GET /tasks/{task_uid}`
-- `POST /tasks/cancel`
-- `DELETE /tasks`
+- `POST /stores/{index_uid}/records`
+- `GET /stores/{index_uid}/records`
+- `GET /stores/{index_uid}/records/{doc_id}`
+- `GET /jobs`
+- `GET /jobs/{task_uid}`
+- `POST /jobs/abort`
+- `DELETE /jobs`
+
+## Query parameter reference
+
+Job listing, abort, and delete accept these query-string filters:
+- `ids` — comma-separated job IDs
+- `states` — comma-separated states
+- `kinds` — comma-separated job kinds
+- `storeIds` — comma-separated store IDs
+- `abortedBy` — single job ID
+
+Job listing also accepts:
+- `pageSize` — maximum number of results
+- `beforeId` — return only jobs with ID strictly less than this value
+
+Record submission expects a JSON body of the form `{"records": [...]}`.
 
 ## In-scope behavioral inventory
 
