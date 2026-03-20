@@ -13,6 +13,7 @@ import time
 from pathlib import Path
 from typing import Dict, List, Optional
 
+import pytest
 import requests
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
@@ -47,14 +48,12 @@ CONTROL_BASE = "http://127.0.0.1:19110"
 CANDIDATE_BASE = "http://127.0.0.1:8108"
 CANDIDATE_DIR = Path("/workspace/candidate")
 PROBE_LAB = Path("/workspace/probe_lab")
-REWARD_PATH = Path("/logs/verifier/reward.txt")
-REPORT_PATH = Path("/logs/verifier/report.json")
+ASYNC_STATUS_LOG_PATH = Path("/logs/verifier/async_statuses.log")
 IMMUTABLE_HASHES = {"README.md": "2f9bc972d5066e282d1ffeac6a24e36e37c4bc3008c2f37fbc2898e47edd62b0", "clear_reference_hookbox.sh": "137536bb0d4c3e510e502f7a0dfe168c6075a5ed66d77e1532453c1b316257b8", "reset_reference.sh": "e21547c33fda1f129af72bc473ec26bf7f7c445a76e52abe410eddee7a201d7f", "restart_reference.sh": "18287a857f2304223e803983999d68e046031b98ffdc3bd1f7e7d37a3e789535", "wait_reference.sh": "1a1d5dfe45556dc81196409cf130d8bfe10f7c8852f9cab2e674e147d0ebac19"}
 WEBHOOK_AUTH = "Bearer hidden-verifier-auth"
 EXPECTED_ENQUEUE_STATUS = 202
 ACCEPTED_ENQUEUE_STATUSES = {200, EXPECTED_ENQUEUE_STATUS}
 ENQUEUE_STATUS_PENALTY = 0.05
-enqueue_statuses: List[int] = []
 
 
 def sha256_file(path: Path) -> str:
@@ -70,6 +69,12 @@ def sha256_file(path: Path) -> str:
 
 def request(method: str, url: str, **kwargs):
     return requests.request(method, url, timeout=kwargs.pop("timeout", 5), **kwargs)
+
+
+def record_async_status(status_code: int) -> None:
+    ASYNC_STATUS_LOG_PATH.parent.mkdir(parents=True, exist_ok=True)
+    with ASYNC_STATUS_LOG_PATH.open("a", encoding="utf-8") as f:
+        f.write(f"{status_code}\n")
 
 
 def wait_http_ok(url: str, timeout: float = 20.0):
@@ -223,7 +228,7 @@ class CandidateProcess:
 def enqueue_docs(index_uid: str, docs: List[Dict]):
     r = request("POST", f"{CANDIDATE_BASE}{STORE_RECORDS_ROUTE.format(index_uid=index_uid)}", json={RECORDS_BODY_KEY: docs})
     assert r.status_code in ACCEPTED_ENQUEUE_STATUSES, r.text
-    enqueue_statuses.append(r.status_code)
+    record_async_status(r.status_code)
     return r.json()[JOB_ID_KEY]
 
 
@@ -313,7 +318,8 @@ def case_cancel_interrupts_batch():
             t2 = enqueue_docs("ix", [{"id": 3, "title": "also-cancel"}])
             time.sleep(0.12)
             r = request("POST", f"{CANDIDATE_BASE}{ABORT_JOBS_ROUTE}", params={"ids": f"{t1},{t2}"})
-            assert r.status_code == 202, r.text
+            assert r.status_code in ACCEPTED_ENQUEUE_STATUSES, r.text
+            record_async_status(r.status_code)
             cancel_uid = r.json()[JOB_ID_KEY]
             cancel_task = wait_task(cancel_uid)
             after_t0 = wait_task(t0)
@@ -345,7 +351,8 @@ def case_task_deletion_filters():
             t1 = enqueue_docs("delix", [{"id": 2, "title": "y"}])
             time.sleep(0.1)
             r = request("POST", f"{CANDIDATE_BASE}{ABORT_JOBS_ROUTE}", params={"ids": str(t1)})
-            assert r.status_code == 202, r.text
+            assert r.status_code in ACCEPTED_ENQUEUE_STATUSES, r.text
+            record_async_status(r.status_code)
             cancel_uid = r.json()[JOB_ID_KEY]
             wait_task(cancel_uid)
             wait_task(t0)
@@ -354,7 +361,8 @@ def case_task_deletion_filters():
             assert missing.status_code == 400, missing.text
             assert missing.json()["code"] == MISSING_JOB_FILTERS_CODE
             delete = request("DELETE", f"{CANDIDATE_BASE}{JOBS_ROUTE}", params={"states": ABORTED_STATE})
-            assert delete.status_code == 202, delete.text
+            assert delete.status_code in ACCEPTED_ENQUEUE_STATUSES, delete.text
+            record_async_status(delete.status_code)
             delete_uid = delete.json()[JOB_ID_KEY]
             delete_task = wait_task(delete_uid)
             assert delete_task[KIND_KEY] == JOB_PRUNE_KIND
@@ -441,53 +449,30 @@ def case_restart_recovery_and_uids():
         finally:
             cp2.stop()
 
-
-def main():
-    results = []
-    weights = {
-        "integrity": 0.15,
-        "batching_and_hook_payload": 0.20,
-        "cancel_interrupts_batch": 0.25,
-        "task_deletion_filters": 0.15,
-        "webhook_blocks_scheduler_and_logs_failures": 0.10,
-        "restart_recovery_and_uids": 0.15,
-    }
-
-    def run_case(name, fn, pre_stop=False):
-        try:
-            fn()
-            results.append({"name": name, "passed": True, "weight": weights[name]})
-        except Exception as exc:
-            results.append({"name": name, "passed": False, "weight": weights[name], "error": repr(exc)})
-
-    run_case("integrity", check_probe_lab_integrity, pre_stop=True)
+@pytest.fixture(scope="session")
+def reference_stopped():
     stop_reference()
-    run_case("batching_and_hook_payload", case_batching_and_hook_payload)
-    run_case("cancel_interrupts_batch", case_cancel_interrupts_batch)
-    run_case("task_deletion_filters", case_task_deletion_filters)
-    run_case("webhook_blocks_scheduler_and_logs_failures", case_webhook_blocks_scheduler_and_logs_failures)
-    run_case("restart_recovery_and_uids", case_restart_recovery_and_uids)
-
-    reward = sum(r["weight"] for r in results if r["passed"])
-    penalties = []
-    non_async_enqueue_count = sum(status != EXPECTED_ENQUEUE_STATUS for status in enqueue_statuses)
-    if non_async_enqueue_count:
-        reward = max(0.0, reward - ENQUEUE_STATUS_PENALTY)
-        penalties.append({
-            "name": "enqueue_status_not_202",
-            "amount": ENQUEUE_STATUS_PENALTY,
-            "count": non_async_enqueue_count,
-            "expected": EXPECTED_ENQUEUE_STATUS,
-            "observed": sorted(set(enqueue_statuses)),
-        })
-    REWARD_PATH.parent.mkdir(parents=True, exist_ok=True)
-    REWARD_PATH.write_text(f"{reward:.4f}\n", encoding="utf-8")
-    report = {"reward": reward, "results": results}
-    if penalties:
-        report["penalties"] = penalties
-    REPORT_PATH.write_text(json.dumps(report, indent=2), encoding="utf-8")
-    print(json.dumps(report, indent=2))
 
 
-if __name__ == "__main__":
-    main()
+def test_integrity():
+    check_probe_lab_integrity()
+
+
+def test_batching_and_hook_payload(reference_stopped):
+    case_batching_and_hook_payload()
+
+
+def test_cancel_interrupts_batch(reference_stopped):
+    case_cancel_interrupts_batch()
+
+
+def test_task_deletion_filters(reference_stopped):
+    case_task_deletion_filters()
+
+
+def test_webhook_blocks_scheduler_and_logs_failures(reference_stopped):
+    case_webhook_blocks_scheduler_and_logs_failures()
+
+
+def test_restart_recovery_and_uids(reference_stopped):
+    case_restart_recovery_and_uids()

@@ -84,24 +84,25 @@ The task is intentionally about runtime behavior, not source recovery: queue ord
   A mirrored copy of the canonical API mapping for the oracle path.
 
   This mirror is intentional: Harbor uploads `solution/` to the oracle, so the oracle needs its own copy even though the canonical source lives under `environment/hidden/internal/`.
+  Update mirrors with `python scripts/sync_api_surface.py` and verify them with `python scripts/sync_api_surface.py --check`.
 
 ### `tests/`
 
 - `tests/test.sh`
-  Verifier entrypoint. It just runs `test_state.py`.
+  Verifier entrypoint. It runs `pytest` over `test_state.py`, then writes `reward.txt` and `report.json`.
 
 - `tests/test_state.py`
   The real verifier. It:
   - checks probe-lab integrity,
   - starts and stops the candidate repeatedly,
   - drives end-to-end HTTP behavior checks,
-  - computes the weighted reward,
-  - writes `reward.txt` and `report.json`.
+  - exposes each weighted behavior check as a pytest test.
 
 - `tests/api_surface.py`
   A mirrored copy of the canonical API mapping for the verifier path.
 
   This mirror is also intentional: Harbor uploads `tests/` to the verifier separately from the environment image.
+  Update mirrors with `python scripts/sync_api_surface.py` and verify them with `python scripts/sync_api_surface.py --check`.
 
 ## Public Surface
 
@@ -167,13 +168,17 @@ These are the easiest places for a candidate to look plausible while still being
 
 I've tested about 10 trials of Opus 4.6. It achieves an average reward of roughly `0.45`. The right way to view this task is pass@k: success means passing the full verifier, not just getting partial credit. Across those ten trials, I saw one full-score pass.
 
-### Enqueue status handling
+### Async status handling
 
-The verifier accepts either `200` or `202` for `POST /stores/{index_uid}/records`.
+The verifier accepts either `200` or `202` for the asynchronous task-creation endpoints:
+
+- `POST /stores/{index_uid}/records`
+- `POST /jobs/abort`
+- `DELETE /jobs`
 
 - `202` is the intended async-contract status.
 - `200` is tolerated so otherwise-interesting runs are not discarded immediately.
-- If any enqueue returns `200` instead of `202`, the verifier applies a one-time `0.05` penalty.
+- If any of those endpoints returns `200` instead of `202`, the verifier applies a one-time `0.05` penalty.
 
 ## How This Task Was Mined And Adapted
 

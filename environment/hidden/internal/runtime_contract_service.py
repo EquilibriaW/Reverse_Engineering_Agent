@@ -1,21 +1,17 @@
 
-import asyncio
 import gzip
 import json
 import os
-import shutil
 import threading
 import time
 from copy import deepcopy
-from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
 import requests
-from fastapi import FastAPI, HTTPException, Query, Request
+from fastapi import FastAPI, HTTPException, Request
 from fastapi.responses import JSONResponse
-from pydantic import BaseModel
 
 from api_surface import (
     ABORT_JOBS_ROUTE,
@@ -56,7 +52,6 @@ def ensure_dir(path: Path) -> None:
 
 
 TERMINAL_STATUSES = {'succeeded', 'failed', 'canceled'}
-WRITABLE_TASK_TYPES = {'documentAdditionOrUpdate'}
 
 
 class QueueService:
@@ -387,10 +382,43 @@ class QueueService:
         with self.lock:
             enqueued_cancellations = [t for t in self._iter_tasks_by_uid() if t['status'] == 'enqueued' and t['type'] == 'taskCancelation']
             for cancel_task in enqueued_cancellations:
-                matched = [t for t in self.state['tasks'] if t['uid'] != cancel_task['uid'] and t['status'] in {'enqueued', 'processing'} and self._match_task_filters(t, cancel_task['filter'])]
-                if any(t['uid'] in current_ids for t in matched):
+                if self._matched_cancel_target_ids(cancel_task) & current_ids:
                     return cancel_task
         return None
+
+    def _matched_cancel_target_ids(self, cancel_task: Dict[str, Any]) -> set[int]:
+        return {
+            task['uid']
+            for task in self.state['tasks']
+            if task['uid'] != cancel_task['uid']
+            and task['status'] in {'enqueued', 'processing'}
+            and self._match_task_filters(task, cancel_task['filter'])
+        }
+
+    def _finalize_cancel_task(self, cancel_task: Dict[str, Any], now: str, matched_count: int, canceled_count: int) -> None:
+        cancel_task['status'] = 'succeeded'
+        cancel_task['details'] = {
+            'matchedTasks': matched_count,
+            'canceledTasks': canceled_count,
+            'originalFilter': deepcopy(cancel_task['filter']),
+        }
+        cancel_task['error'] = None
+        cancel_task['finishedAt'] = now
+        cancel_task['duration'] = duration_iso(max(0.0, self._duration_seconds(cancel_task['startedAt'], now)))
+
+    def _apply_cancel_to_matching_tasks(self, cancel_task: Dict[str, Any], now: str) -> set[int]:
+        matched_ids = self._matched_cancel_target_ids(cancel_task)
+        canceled_count = 0
+        for task in self.state['tasks']:
+            if task['uid'] not in matched_ids:
+                continue
+            task['status'] = 'canceled'
+            task['canceledBy'] = cancel_task['uid']
+            task['finishedAt'] = now
+            task['duration'] = duration_iso(max(0.0, self._duration_seconds(task.get('startedAt') or task['enqueuedAt'], now)))
+            canceled_count += 1
+        self._finalize_cancel_task(cancel_task, now, len(matched_ids), canceled_count)
+        return matched_ids
 
     def _interrupt_with_cancel(self, current_batch: List[Dict[str, Any]], cancel_task: Dict[str, Any]) -> None:
         now = utc_now()
@@ -398,33 +426,14 @@ class QueueService:
         with self.lock:
             cancel_task['status'] = 'processing'
             cancel_task['startedAt'] = now
-            matched = [t for t in self.state['tasks'] if t['uid'] != cancel_task['uid'] and t['status'] in {'enqueued', 'processing'} and self._match_task_filters(t, cancel_task['filter'])]
-            matched_ids = {t['uid'] for t in matched}
-            canceled_count = 0
+            matched_ids = self._apply_cancel_to_matching_tasks(cancel_task, now)
             for task in self.state['tasks']:
-                if task['uid'] == cancel_task['uid']:
-                    continue
-                if task['uid'] in matched_ids:
-                    task['status'] = 'canceled'
-                    task['canceledBy'] = cancel_task['uid']
-                    task['finishedAt'] = now
-                    task['duration'] = duration_iso(max(0.0, self._duration_seconds(task.get('startedAt') or task['enqueuedAt'], now)))
-                    canceled_count += 1
-                elif task['uid'] in current_ids and task['status'] == 'processing':
+                if task['uid'] in current_ids and task['uid'] not in matched_ids and task['status'] == 'processing':
                     # Progress is lost for unmatched tasks in the stopped batch.
                     task['status'] = 'enqueued'
                     task['startedAt'] = None
                     task['finishedAt'] = None
                     task['duration'] = None
-            cancel_task['status'] = 'succeeded'
-            cancel_task['details'] = {
-                'matchedTasks': len(matched_ids),
-                'canceledTasks': canceled_count,
-                'originalFilter': deepcopy(cancel_task['filter']),
-            }
-            cancel_task['error'] = None
-            cancel_task['finishedAt'] = now
-            cancel_task['duration'] = duration_iso(max(0.0, self._duration_seconds(cancel_task['startedAt'], now)))
             self._save_state()
             payload = [self._task_full(cancel_task)]
         self._send_webhook(payload)
@@ -432,25 +441,7 @@ class QueueService:
     def _process_cancel_task(self, cancel_task: Dict[str, Any]) -> None:
         now = utc_now()
         with self.lock:
-            matched = [t for t in self.state['tasks'] if t['uid'] != cancel_task['uid'] and t['status'] in {'enqueued', 'processing'} and self._match_task_filters(t, cancel_task['filter'])]
-            matched_ids = {t['uid'] for t in matched}
-            canceled_count = 0
-            for task in self.state['tasks']:
-                if task['uid'] in matched_ids:
-                    task['status'] = 'canceled'
-                    task['canceledBy'] = cancel_task['uid']
-                    task['finishedAt'] = now
-                    task['duration'] = duration_iso(max(0.0, self._duration_seconds(task.get('startedAt') or task['enqueuedAt'], now)))
-                    canceled_count += 1
-            cancel_task['status'] = 'succeeded'
-            cancel_task['details'] = {
-                'matchedTasks': len(matched_ids),
-                'canceledTasks': canceled_count,
-                'originalFilter': deepcopy(cancel_task['filter']),
-            }
-            cancel_task['error'] = None
-            cancel_task['finishedAt'] = now
-            cancel_task['duration'] = duration_iso(max(0.0, self._duration_seconds(cancel_task['startedAt'], now)))
+            self._apply_cancel_to_matching_tasks(cancel_task, now)
             self._save_state()
             payload = [self._task_full(cancel_task)]
         self._send_webhook(payload)
